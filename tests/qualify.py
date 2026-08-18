@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comprehensive RC6 Standalone Qualification Test Suite for tokalang/notifier v0.1.2."""
+"""Comprehensive RC6 Standalone Qualification Test Suite for tokalang/notifier (current manifest version)."""
 
 from __future__ import annotations
 
