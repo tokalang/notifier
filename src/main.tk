@@ -22,7 +22,7 @@ fn print_usage() {
 }
 
 fn print_version() {
-    println("notifier 0.1.2 (compiler 1.0.0-rc.6)")
+    println("notifier 0.1.3-dev (compiler 1.0.0-rc.6)")
 }
 
 fn main() -> async i32 {

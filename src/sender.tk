@@ -193,7 +193,7 @@ pub fn execute_delivery(cfg: Config, event_path: string, dry_run: bool, cli_inse
     header_map#.insert(string::from("Content-Type"), string::from("application/json"))
     header_map#.insert(string::from("Content-Length"), string::from_int(raw_payload.len() as i32))
     header_map#.insert(string::from("Idempotency-Key"), idempotency_key.clone())
-    header_map#.insert(string::from("User-Agent"), string::from("toka-notifier/0.1.2"))
+    header_map#.insert(string::from("User-Agent"), string::from("toka-notifier/0.1.3-dev"))
     header_map#.insert(string::from("Connection"), string::from("close"))
 
     // 8. Dry-Run Handling

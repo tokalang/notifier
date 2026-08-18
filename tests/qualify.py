@@ -195,11 +195,25 @@ def run_http_server(handler_cls, is_ssl: bool = False, cert_path: Path | None = 
     return server, port, t
 
 
+def get_manifest_version(repo_root: Path) -> str:
+    pkg_content = (repo_root / "package.tk").read_text(encoding="utf-8")
+    for line in pkg_content.splitlines():
+        line = line.strip()
+        if line.startswith("version ="):
+            parts = line.split('"')
+            if len(parts) >= 2:
+                return parts[1]
+    raise RuntimeError("Could not determine package version from package.tk")
+
+
 def main() -> int:
     log("=== Stage 1: Toolchain and Compiler Verification ===")
     repo_root = Path(__file__).resolve().parent.parent
     toka, tokac, sdk_lib = find_sdk()
     log(f"Found Toka SDK: toka={toka}, tokac={tokac}, lib={sdk_lib}")
+
+    current_ver = get_manifest_version(repo_root)
+    log(f"Active repository manifest version: {current_ver}")
 
     res = run_cmd([str(toka), "--version"])
     assert "1.0.0-rc.6" in res.stdout
@@ -219,7 +233,7 @@ def main() -> int:
         assert "--dry-run" in res.stdout
 
         res = run_cmd([str(notifier_bin), "--version"])
-        assert "notifier 0.1.2" in res.stdout
+        assert f"notifier {current_ver}" in res.stdout
 
         log("=== Stage 4: YAML with Hash Inside Quoted String & Dry-Run Redaction ===")
         sample_event = work_dir / "event1.json"
@@ -365,7 +379,7 @@ headers:
                 assert rec_headers_lower.get("idempotency-key") == expected_sha
                 assert rec_headers_lower.get("content-type") == "application/json"
                 assert rec_headers_lower.get("x-event-topic") == "deployments"
-                assert rec_headers_lower.get("user-agent") == "toka-notifier/0.1.2"
+                assert rec_headers_lower.get("user-agent") == f"toka-notifier/{current_ver}"
         finally:
             http_server.shutdown()
 
@@ -566,18 +580,15 @@ ca_file: "{mismatch_cert}"
             mismatch_server.shutdown()
 
         log("=== Stage 20: Manifest, CLI --version, User-Agent & README Consistency ===")
-        # Check package.tk version
-        pkg_content = (repo_root / "package.tk").read_text(encoding="utf-8")
-        assert 'version = "0.1.2"' in pkg_content, "package.tk must declare version 0.1.2"
-
-        # Check README.md
-        readme_content = (repo_root / "README.md").read_text(encoding="utf-8")
-        assert 'notifier = "notifier:0.1.2"' in readme_content, "README.md must guide installation of notifier:0.1.2"
-        assert "notifier:0.1.0" not in readme_content, "README.md must not contain stale 0.1.0 reference"
-
-        # Check binary --version
+        # 1. Binary --version matches package.tk
         res = run_cmd([str(notifier_bin), "--version"])
-        assert "notifier 0.1.2" in res.stdout, "--version output must match package manifest version 0.1.2"
+        assert f"notifier {current_ver}" in res.stdout, f"--version output must contain 'notifier {current_ver}'"
+
+        # 2. README.md must guide installation of latest stable release (e.g. 0.1.2) and not stale 0.1.0/0.1.1
+        readme_content = (repo_root / "README.md").read_text(encoding="utf-8")
+        assert 'notifier = "notifier:0.1.2"' in readme_content, "README.md must guide installation of latest stable release notifier:0.1.2"
+        assert "notifier:0.1.0" not in readme_content, "README.md must not contain stale 0.1.0 reference"
+        assert "notifier:0.1.1" not in readme_content, "README.md must not contain stale 0.1.1 reference"
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
