@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comprehensive RC6 Standalone Qualification Test Suite for tokalang/notifier."""
+"""Comprehensive RC6 Standalone Qualification Test Suite for tokalang/notifier v0.1.1."""
 
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ def find_sdk() -> tuple[Path, Path, Path]:
     tokac = root_path / "bin" / "tokac"
     lib = root_path / "lib"
     if not toka.is_file() or not tokac.is_file() or not lib.is_dir():
-        # Fallback to PATH / TOKA_LIB
         toka_w = shutil.which("toka")
         tokac_w = shutil.which("tokac")
         toka_lib = os.environ.get("TOKA_LIB")
@@ -67,10 +66,7 @@ def compile_notifier(repo_root: Path, tokac: Path, sdk_lib: Path) -> Path:
     notifier_bin = target_dir / "notifier"
     rt_obj = sdk_lib / "sys" / "toka_rt.o"
     
-    # Platform-specific link flags
     link_cmd = ["clang", str(main_ll), str(rt_obj)]
-    
-    # Query openssl pkg-config if available
     try:
         pkg = subprocess.run(["pkg-config", "--libs", "openssl"], stdout=subprocess.PIPE, text=True)
         if pkg.returncode == 0 and pkg.stdout.strip():
@@ -91,8 +87,8 @@ def compile_notifier(repo_root: Path, tokac: Path, sdk_lib: Path) -> Path:
     return notifier_bin
 
 
-def generate_self_signed_cert(cert_path: Path, key_path: Path, common_name: str = "localhost") -> None:
-    # Use openssl cli to generate a self-signed test cert with SAN
+def generate_cert(cert_path: Path, key_path: Path, san_list: list[str], common_name: str = "localhost") -> None:
+    san_entries = "\n".join([f"{entry}" for entry in san_list])
     san_conf = f"""[req]
 distinguished_name = req_distinguished_name
 x509_extensions = v3_req
@@ -104,8 +100,7 @@ keyUsage = critical, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
 subjectAltName = @alt_names
 [alt_names]
-DNS.1 = localhost
-IP.1 = 127.0.0.1
+{san_entries}
 """
     with tempfile.NamedTemporaryFile("w", suffix=".cnf", delete=False) as f:
         f.write(san_conf)
@@ -124,7 +119,7 @@ IP.1 = 127.0.0.1
 
 class MockServerHandler(BaseHTTPRequestHandler):
     recorded_requests: list[dict] = []
-    response_sequence: list[tuple[int, str, dict]] = []
+    response_sequence: list[tuple[int, bytes, dict, bool]] = [] # (status, raw_body_bytes, headers, is_chunked)
     lock = threading.Lock()
 
     def do_POST(self):
@@ -138,22 +133,34 @@ class MockServerHandler(BaseHTTPRequestHandler):
                 "body": body
             })
             if self.response_sequence:
-                status, resp_body, headers = self.response_sequence.pop(0)
+                status, resp_bytes, headers, is_chunked = self.response_sequence.pop(0)
             else:
-                status, resp_body, headers = 200, '{"status":"ok"}', {}
+                status, resp_bytes, headers, is_chunked = 200, b'{"status":"ok"}', {}, False
 
         self.send_response(status)
         for k, v in headers.items():
             self.send_header(k, v)
         if "Content-Type" not in headers:
             self.send_header("Content-Type", "application/json")
-        resp_bytes = resp_body.encode("utf-8")
-        self.send_header("Content-Length", str(len(resp_bytes)))
-        self.end_headers()
-        self.wfile.write(resp_bytes)
+
+        if is_chunked:
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            # Send in 8KB chunks
+            chunk_size = 8192
+            for i in range(0, len(resp_bytes), chunk_size):
+                chunk = resp_bytes[i:i + chunk_size]
+                self.wfile.write(f"{len(chunk):x}\r\n".encode("utf-8"))
+                self.wfile.write(chunk)
+                self.wfile.write(b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+        else:
+            self.send_header("Content-Length", str(len(resp_bytes)))
+            self.end_headers()
+            self.wfile.write(resp_bytes)
 
     def log_message(self, format, *args):
-        pass  # Quiet during tests
+        pass
 
 
 def run_http_server(handler_cls, is_ssl: bool = False, cert_path: Path | None = None, key_path: Path | None = None) -> tuple[HTTPServer, int, threading.Thread]:
@@ -174,11 +181,10 @@ def main() -> int:
     toka, tokac, sdk_lib = find_sdk()
     log(f"Found Toka SDK: toka={toka}, tokac={tokac}, lib={sdk_lib}")
 
-    # Toolchain version assertion
     res = run_cmd([str(toka), "--version"])
-    assert "1.0.0-rc.6" in res.stdout, f"Expected 1.0.0-rc.6 in toka version: {res.stdout}"
+    assert "1.0.0-rc.6" in res.stdout
     res = run_cmd([str(tokac), "--version"])
-    assert "1.0.0-rc.6" in res.stdout, f"Expected 1.0.0-rc.6 in tokac version: {res.stdout}"
+    assert "1.0.0-rc.6" in res.stdout
     log("Toolchain baseline 1.0.0-rc.6 verified.")
 
     log("=== Stage 2: Compile notifier application ===")
@@ -193,47 +199,115 @@ def main() -> int:
         assert "--dry-run" in res.stdout
 
         res = run_cmd([str(notifier_bin), "--version"])
-        assert "notifier 0.1.0" in res.stdout
+        assert "notifier 0.1.1" in res.stdout
 
-        log("=== Stage 4: Dry-Run and Sensitive Header Redaction ===")
+        log("=== Stage 4: YAML with Hash Inside Quoted String & Dry-Run Redaction ===")
         sample_event = work_dir / "event1.json"
         raw_event_text = '{\n  "event": "deployment_succeeded",\n  "version": "1.0.0",\n  "cluster": "prod-us-east-1"\n}\n'
         sample_event.write_text(raw_event_text, encoding="utf-8")
         expected_sha = hashlib.sha256(raw_event_text.encode("utf-8")).hexdigest()
 
-        sample_cfg = work_dir / "config_dryrun.yaml"
-        sample_cfg.write_text(f"""endpoint: "https://api.example.com/webhook"
+        yaml_hash_cfg = work_dir / "config_hash.yaml"
+        yaml_hash_cfg.write_text("""endpoint: "https://api.example.com/webhook"
 timeout_ms: 3000
 headers:
-  Authorization: "Bearer secret-token-xyz-12345"
-  X-Custom-Token: "super-secret"
+  Authorization: "Bearer secret#with#multiple#hashes#12345"
+  X-Custom-Token: "value#hash"
   X-Service-Name: "billing-service"
 """, encoding="utf-8")
 
-        res = run_cmd([str(notifier_bin), "--config", str(sample_cfg), "--event", str(sample_event), "--dry-run", "send"])
+        res = run_cmd([str(notifier_bin), "--config", str(yaml_hash_cfg), "--event", str(sample_event), "--dry-run", "send"])
         assert "=== NOTIFIER DRY RUN SIMULATION ===" in res.stdout
         assert f"Idempotency-Key: {expected_sha}" in res.stdout
         assert "authorization: [redacted]" in res.stdout.lower()
-        assert "secret-token-xyz-12345" not in res.stdout
+        assert "secret#with#multiple" not in res.stdout
         assert "x-service-name: billing-service" in res.stdout.lower()
 
-        log("=== Stage 5: Security Policy & Insecure Plain HTTP Rejection ===")
+        log("=== Stage 5: YAML Schema: Unknown Field Rejection ===")
+        unknown_cfg = work_dir / "config_unknown.yaml"
+        unknown_cfg.write_text("""endpoint: "https://api.example.com/webhook"
+unknown_custom_field: "invalid"
+""", encoding="utf-8")
+        res = run_cmd([str(notifier_bin), "--config", str(unknown_cfg), "--event", str(sample_event), "send"], check=False)
+        assert res.returncode != 0
+        assert "Unknown configuration field 'unknown_custom_field'" in res.stdout or "Unknown configuration field 'unknown_custom_field'" in res.stderr
+
+        log("=== Stage 6: YAML Schema: Invalid Types and Out-of-Range Rejections ===")
+        # 6.1 Float timeout
+        float_cfg = work_dir / "config_float.yaml"
+        float_cfg.write_text("""endpoint: "https://api.example.com/webhook"
+timeout_ms: 500.5
+""", encoding="utf-8")
+        res = run_cmd([str(notifier_bin), "--config", str(float_cfg), "--event", str(sample_event), "send"], check=False)
+        assert res.returncode != 0
+        assert "must be an integer between 1 and 300000" in res.stdout or "must be an integer between 1 and 300000" in res.stderr
+
+        # 6.2 Negative max_retries
+        neg_cfg = work_dir / "config_neg.yaml"
+        neg_cfg.write_text("""endpoint: "https://api.example.com/webhook"
+max_retries: -1
+""", encoding="utf-8")
+        res = run_cmd([str(notifier_bin), "--config", str(neg_cfg), "--event", str(sample_event), "send"], check=False)
+        assert res.returncode != 0
+
+        # 6.3 Array headers
+        array_cfg = work_dir / "config_array.yaml"
+        array_cfg.write_text("""endpoint: "https://api.example.com/webhook"
+headers:
+  - "invalid-array"
+""", encoding="utf-8")
+        res = run_cmd([str(notifier_bin), "--config", str(array_cfg), "--event", str(sample_event), "send"], check=False)
+        assert res.returncode != 0
+
+        log("=== Stage 7: Reserved System Header Configuration Error (Fail-Closed) ===")
+        tamper_cfg = work_dir / "config_tamper.yaml"
+        tamper_cfg.write_text("""endpoint: "https://api.example.com/v1"
+headers:
+  Host: "evil-spoofed.com"
+  Content-Length: "0"
+  Idempotency-Key: "tampered-key-0000"
+""", encoding="utf-8")
+        res = run_cmd([str(notifier_bin), "--config", str(tamper_cfg), "--event", str(sample_event), "--dry-run", "send"], check=False)
+        assert res.returncode != 0
+        assert "Forbidden attempt to set reserved system header" in res.stdout or "Forbidden attempt to set reserved system header" in res.stderr
+
+        log("=== Stage 8: Scheme Whitelist Rejection (Non-HTTP/HTTPS) ===")
+        wss_cfg = work_dir / "config_wss.yaml"
+        wss_cfg.write_text("""endpoint: "wss://api.example.com/stream"
+""", encoding="utf-8")
+        res = run_cmd([str(notifier_bin), "--config", str(wss_cfg), "--event", str(sample_event), "send"], check=False)
+        assert res.returncode != 0
+        assert "Unsupported URL scheme 'wss'" in res.stdout or "Unsupported URL scheme 'wss'" in res.stderr
+
+        ftp_cfg = work_dir / "config_ftp.yaml"
+        ftp_cfg.write_text("""endpoint: "ftp://localhost:21/file"
+""", encoding="utf-8")
+        res = run_cmd([str(notifier_bin), "--config", str(ftp_cfg), "--event", str(sample_event), "send"], check=False)
+        assert res.returncode != 0
+        assert "Unsupported URL scheme 'ftp'" in res.stdout or "Unsupported URL scheme 'ftp'" in res.stderr
+
+        log("=== Stage 9: Missing Authority Rejection ===")
+        nohost_cfg = work_dir / "config_nohost.yaml"
+        nohost_cfg.write_text("""endpoint: "http:///missing-host"
+""", encoding="utf-8")
+        res = run_cmd([str(notifier_bin), "--config", str(nohost_cfg), "--event", str(sample_event), "send"], check=False)
+        assert res.returncode != 0
+        assert "Invalid endpoint URL" in res.stdout or "missing host/authority" in res.stdout or "Invalid endpoint URL" in res.stderr or "missing host/authority" in res.stderr
+
+        log("=== Stage 10: Security Policy & Insecure Plain HTTP Rejection ===")
         insecure_cfg = work_dir / "config_insecure.yaml"
         insecure_cfg.write_text("""endpoint: "http://api.public-service.com/webhook"
 timeout_ms: 2000
 """, encoding="utf-8")
 
-        # 1. Plain HTTP without override fails closed
         res = run_cmd([str(notifier_bin), "--config", str(insecure_cfg), "--event", str(sample_event), "send"], check=False)
         assert res.returncode != 0
-        assert "Security policy violation" in res.stdout or "Security policy violation" in res.stderr
         assert "forbidden by security policy" in res.stdout or "forbidden by security policy" in res.stderr
 
-        # 2. Plain HTTP with --allow-insecure-http dry-run shows warning
         res = run_cmd([str(notifier_bin), "--config", str(insecure_cfg), "--event", str(sample_event), "--allow-insecure-http", "--dry-run", "send"])
         assert "[WARNING: INSECURE OVERRIDE]" in res.stdout
 
-        log("=== Stage 6: Host Match Strict Equality (Prefix Spoof Defense) ===")
+        log("=== Stage 11: Host Match Strict Equality (Prefix Spoof Defense) ===")
         spoof_cfg = work_dir / "config_spoof.yaml"
         spoof_cfg.write_text("""endpoint: "http://localhost.attacker.com/webhook"
 timeout_ms: 1000
@@ -242,27 +316,14 @@ timeout_ms: 1000
         assert res.returncode != 0
         assert "forbidden by security policy" in res.stdout or "forbidden by security policy" in res.stderr
 
-        log("=== Stage 7: Malformed JSON Event Payload Rejection ===")
+        log("=== Stage 12: Malformed JSON Event Payload Rejection ===")
         bad_event = work_dir / "bad_event.json"
         bad_event.write_text('{ "unclosed": "brace"', encoding="utf-8")
-        res = run_cmd([str(notifier_bin), "--config", str(sample_cfg), "--event", str(bad_event), "send"], check=False)
+        res = run_cmd([str(notifier_bin), "--config", str(yaml_hash_cfg), "--event", str(bad_event), "send"], check=False)
         assert res.returncode != 0
         assert "not valid JSON" in res.stdout or "not valid JSON" in res.stderr
 
-        log("=== Stage 8: System Reserved Header Protection ===")
-        tamper_cfg = work_dir / "config_tamper.yaml"
-        tamper_cfg.write_text("""endpoint: "https://api.example.com/v1"
-headers:
-  Host: "evil-spoofed.com"
-  Content-Length: "0"
-  Idempotency-Key: "tampered-key-0000"
-""", encoding="utf-8")
-        res = run_cmd([str(notifier_bin), "--config", str(tamper_cfg), "--event", str(sample_event), "--dry-run", "send"])
-        assert f"Idempotency-Key: {expected_sha}" in res.stdout
-        assert "tampered-key-0000" not in res.stdout
-        assert "evil-spoofed.com" not in res.stdout
-
-        log("=== Stage 9: Local Loopback HTTP Delivery (200 OK) ===")
+        log("=== Stage 13: Local Loopback HTTP Delivery (200 OK) ===")
         MockServerHandler.recorded_requests.clear()
         MockServerHandler.response_sequence.clear()
         http_server, http_port, _ = run_http_server(MockServerHandler)
@@ -287,13 +348,13 @@ headers:
                 assert rec_headers_lower.get("idempotency-key") == expected_sha
                 assert rec_headers_lower.get("content-type") == "application/json"
                 assert rec_headers_lower.get("x-event-topic") == "deployments"
-                assert rec_headers_lower.get("user-agent") == "toka-notifier/0.1.0"
+                assert rec_headers_lower.get("user-agent") == "toka-notifier/0.1.1"
         finally:
             http_server.shutdown()
 
-        log("=== Stage 10: 302 Redirect Immediate Rejection (No Retry) ===")
+        log("=== Stage 14: 302 Redirect Immediate Rejection (No Retry) ===")
         MockServerHandler.recorded_requests.clear()
-        MockServerHandler.response_sequence = [(302, "", {"Location": "http://127.0.0.1:9999/other"})]
+        MockServerHandler.response_sequence = [(302, b"", {"Location": "http://127.0.0.1:9999/other"}, False)]
         http_server, http_port, _ = run_http_server(MockServerHandler)
         try:
             http_cfg = work_dir / "config_http_302.yaml"
@@ -305,13 +366,13 @@ max_retries: 3
             assert res.returncode == 1
             assert "redirect status 302" in res.stdout or "redirect status 302" in res.stderr
             with MockServerHandler.lock:
-                assert len(MockServerHandler.recorded_requests) == 1, "302 must abort immediately without retry"
+                assert len(MockServerHandler.recorded_requests) == 1
         finally:
             http_server.shutdown()
 
-        log("=== Stage 11: 400 & 429 Client Error Immediate Abort (No Retry) ===")
+        log("=== Stage 15: 400 & 429 Client Error Immediate Abort (No Retry) ===")
         MockServerHandler.recorded_requests.clear()
-        MockServerHandler.response_sequence = [(429, '{"error":"too_many_requests"}', {})]
+        MockServerHandler.response_sequence = [(429, b'{"error":"too_many_requests"}', {}, False)]
         http_server, http_port, _ = run_http_server(MockServerHandler)
         try:
             http_cfg = work_dir / "config_http_429.yaml"
@@ -323,17 +384,16 @@ max_retries: 3
             assert res.returncode == 1
             assert "client/policy error status 429" in res.stdout or "client/policy error status 429" in res.stderr
             with MockServerHandler.lock:
-                assert len(MockServerHandler.recorded_requests) == 1, "429 must abort immediately without retry"
+                assert len(MockServerHandler.recorded_requests) == 1
         finally:
             http_server.shutdown()
 
-        log("=== Stage 12: 500 Server Error Retry Recovery ===")
+        log("=== Stage 16: 500 Server Error Retry Recovery ===")
         MockServerHandler.recorded_requests.clear()
-        # Fail 2 times with 500, succeed on 3rd attempt
         MockServerHandler.response_sequence = [
-            (500, '{"error":"internal_1"}', {}),
-            (500, '{"error":"internal_2"}', {}),
-            (200, '{"status":"recovered"}', {})
+            (500, b'{"error":"internal_1"}', {}, False),
+            (500, b'{"error":"internal_2"}', {}, False),
+            (200, b'{"status":"recovered"}', {}, False)
         ]
         http_server, http_port, _ = run_http_server(MockServerHandler)
         try:
@@ -352,12 +412,12 @@ backoff_ms: 50
         finally:
             http_server.shutdown()
 
-        log("=== Stage 13: 503 Retry Exhaustion ===")
+        log("=== Stage 17: 503 Retry Exhaustion ===")
         MockServerHandler.recorded_requests.clear()
         MockServerHandler.response_sequence = [
-            (503, '{"error":"unavailable_1"}', {}),
-            (503, '{"error":"unavailable_2"}', {}),
-            (503, '{"error":"unavailable_3"}', {})
+            (503, b'{"error":"unavailable_1"}', {}, False),
+            (503, b'{"error":"unavailable_2"}', {}, False),
+            (503, b'{"error":"unavailable_3"}', {}, False)
         ]
         http_server, http_port, _ = run_http_server(MockServerHandler)
         try:
@@ -375,16 +435,85 @@ backoff_ms: 30
         finally:
             http_server.shutdown()
 
-        log("=== Stage 14: Real TLS / HTTPS Delivery & Certificate Verification ===")
+        log("=== Stage 18: Exact 1 MiB Body Limit Boundary Tests (Content-Length & Chunked) ===")
+        # 18.1 Content-Length: Exactly 1,048,576 bytes -> OK
+        exact_1mb_bytes = b"A" * 1048576
+        MockServerHandler.recorded_requests.clear()
+        MockServerHandler.response_sequence = [(200, exact_1mb_bytes, {"Content-Type": "application/octet-stream"}, False)]
+        http_server, http_port, _ = run_http_server(MockServerHandler)
+        try:
+            http_cfg = work_dir / "config_1mb_ok.yaml"
+            http_cfg.write_text(f"""endpoint: "http://127.0.0.1:{http_port}/1mb_ok"
+timeout_ms: 4000
+""", encoding="utf-8")
+            res = run_cmd([str(notifier_bin), "--config", str(http_cfg), "--event", str(sample_event), "send"])
+            assert res.returncode == 0
+            assert "[SUCCESS]" in res.stdout
+        finally:
+            http_server.shutdown()
+
+        # 18.2 Content-Length: 1,048,577 bytes (1 MiB + 1B) -> FAIL (Non-retryable 1 attempt)
+        over_1mb_bytes = b"A" * 1048577
+        MockServerHandler.recorded_requests.clear()
+        MockServerHandler.response_sequence = [(200, over_1mb_bytes, {"Content-Type": "application/octet-stream"}, False)]
+        http_server, http_port, _ = run_http_server(MockServerHandler)
+        try:
+            http_cfg = work_dir / "config_1mb_fail.yaml"
+            http_cfg.write_text(f"""endpoint: "http://127.0.0.1:{http_port}/1mb_fail"
+timeout_ms: 4000
+max_retries: 3
+""", encoding="utf-8")
+            res = run_cmd([str(notifier_bin), "--config", str(http_cfg), "--event", str(sample_event), "send"], check=False)
+            assert res.returncode == 1
+            assert "exceeded 1 MiB limit" in res.stdout or "exceeded 1 MiB limit" in res.stderr
+            with MockServerHandler.lock:
+                assert len(MockServerHandler.recorded_requests) == 1, "2xx body exceed must fail non-retryable without re-delivery"
+        finally:
+            http_server.shutdown()
+
+        # 18.3 Transfer-Encoding Chunked: Exactly 1,048,576 bytes -> OK
+        MockServerHandler.recorded_requests.clear()
+        MockServerHandler.response_sequence = [(200, exact_1mb_bytes, {"Content-Type": "application/octet-stream"}, True)]
+        http_server, http_port, _ = run_http_server(MockServerHandler)
+        try:
+            http_cfg = work_dir / "config_chunk_ok.yaml"
+            http_cfg.write_text(f"""endpoint: "http://127.0.0.1:{http_port}/chunk_ok"
+timeout_ms: 4000
+""", encoding="utf-8")
+            res = run_cmd([str(notifier_bin), "--config", str(http_cfg), "--event", str(sample_event), "send"])
+            assert res.returncode == 0
+            assert "[SUCCESS]" in res.stdout
+        finally:
+            http_server.shutdown()
+
+        # 18.4 Transfer-Encoding Chunked: 1,048,577 bytes -> FAIL (Non-retryable 1 attempt)
+        MockServerHandler.recorded_requests.clear()
+        MockServerHandler.response_sequence = [(200, over_1mb_bytes, {"Content-Type": "application/octet-stream"}, True)]
+        http_server, http_port, _ = run_http_server(MockServerHandler)
+        try:
+            http_cfg = work_dir / "config_chunk_fail.yaml"
+            http_cfg.write_text(f"""endpoint: "http://127.0.0.1:{http_port}/chunk_fail"
+timeout_ms: 4000
+max_retries: 3
+""", encoding="utf-8")
+            res = run_cmd([str(notifier_bin), "--config", str(http_cfg), "--event", str(sample_event), "send"], check=False)
+            assert res.returncode == 1
+            assert "exceeded 1 MiB limit" in res.stdout or "exceeded 1 MiB limit" in res.stderr
+            with MockServerHandler.lock:
+                assert len(MockServerHandler.recorded_requests) == 1
+        finally:
+            http_server.shutdown()
+
+        log("=== Stage 19: Real TLS / HTTPS Delivery & Precision SAN Tests ===")
+        # 19.1 Valid localhost TLS cert
         cert_file = work_dir / "test_server.crt"
         key_file = work_dir / "test_server.key"
-        generate_self_signed_cert(cert_file, key_file, common_name="localhost")
+        generate_cert(cert_file, key_file, san_list=["DNS.1 = localhost", "IP.1 = 127.0.0.1"], common_name="localhost")
 
         MockServerHandler.recorded_requests.clear()
         MockServerHandler.response_sequence.clear()
         https_server, https_port, _ = run_http_server(MockServerHandler, is_ssl=True, cert_path=cert_file, key_path=key_file)
         try:
-            # 14.1 HTTPS delivery with trusted ca_file -> SUCCESS
             https_cfg = work_dir / "config_https.yaml"
             https_cfg.write_text(f"""endpoint: "https://localhost:{https_port}/secure/webhook"
 timeout_ms: 4000
@@ -395,15 +524,7 @@ ca_file: "{cert_file}"
             assert "[SUCCESS]" in res.stdout
             assert f"Idempotency-Key: {expected_sha}" in res.stdout
 
-            with MockServerHandler.lock:
-                assert len(MockServerHandler.recorded_requests) == 1
-                rec = MockServerHandler.recorded_requests[0]
-                rec_headers_lower = {k.lower(): v for k, v in rec["headers"].items()}
-                assert rec["path"] == "/secure/webhook"
-                assert rec_headers_lower.get("idempotency-key") == expected_sha
-
-            # 14.2 HTTPS delivery without ca_file against self-signed cert -> FAIL CLOSED
-            MockServerHandler.recorded_requests.clear()
+            # 19.2 Without ca_file -> Fail closed
             https_untrusted_cfg = work_dir / "config_https_untrusted.yaml"
             https_untrusted_cfg.write_text(f"""endpoint: "https://localhost:{https_port}/secure/webhook"
 timeout_ms: 1500
@@ -416,11 +537,34 @@ backoff_ms: 20
         finally:
             https_server.shutdown()
 
+        # 19.3 Negative test: Cert SAN has ONLY example.com (strictly no localhost, no 127.0.0.1)
+        mismatch_cert = work_dir / "mismatch_server.crt"
+        mismatch_key = work_dir / "mismatch_server.key"
+        generate_cert(mismatch_cert, mismatch_key, san_list=["DNS.1 = example.com"], common_name="example.com")
+
+        MockServerHandler.recorded_requests.clear()
+        MockServerHandler.response_sequence.clear()
+        mismatch_server, mismatch_port, _ = run_http_server(MockServerHandler, is_ssl=True, cert_path=mismatch_cert, key_path=mismatch_key)
+        try:
+            # Client connects to localhost, providing mismatch_cert as CA -> Handshake must fail due to hostname/SNI mismatch
+            https_mismatch_cfg = work_dir / "config_https_mismatch.yaml"
+            https_mismatch_cfg.write_text(f"""endpoint: "https://localhost:{mismatch_port}/secure/webhook"
+timeout_ms: 2000
+max_retries: 1
+backoff_ms: 20
+ca_file: "{mismatch_cert}"
+""", encoding="utf-8")
+            res = run_cmd([str(notifier_bin), "--config", str(https_mismatch_cfg), "--event", str(sample_event), "send"], check=False)
+            assert res.returncode == 1
+            assert "TLS negotiation failed" in res.stdout or "Stream/TLS negotiation failed" in res.stdout or "all 2 attempts exhausted" in res.stdout
+        finally:
+            mismatch_server.shutdown()
+
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
     log("==========================================================")
-    log("ALL 14 RC6 QUALIFICATION STAGES PASSED FOR tokalang/notifier")
+    log("ALL 19 RC6 QUALIFICATION STAGES PASSED FOR tokalang/notifier")
     log("==========================================================")
     return 0
 

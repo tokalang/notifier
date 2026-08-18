@@ -1,16 +1,19 @@
 import std/io::{println}
+import std/vec::{Vec}
 import core/result::{Result}
 import std/fs::{read_to_string}
 import std/thread::{sleep_ms}
 import std/net::{resolve_ipv4, SocketAddrV4, TcpStream}
 import stdx/net/url::{Url, parse_url}
-import stdx/net/http::{HttpClient, HttpRequest, HttpMethod, HeaderMap, HeaderEntry as HttpHeaderEntry}
+import stdx/net/http::{HttpClient, HttpRequest, HttpMethod, HeaderMap, HttpResponseStream}
 import stdx/net/stream::{AsyncStream}
 import stdx/net/tls::{TlsStream}
 import stdx/serde/json as json
 import src/config::{Config, HeaderEntry}
 import src/security::{validate_endpoint_security, is_reserved_system_header, is_sensitive_header}
 import src/hasher::{compute_sha256_hex}
+
+const MAX_BODY_LIMIT_BYTES = 1048576:usize // Exact 1 MiB limit
 
 fn validate_json_payload(input: str) -> Result<bool, string> {
     auto skipped_res = json::json_skip_value(input)
@@ -61,6 +64,50 @@ fn validate_json_payload(input: str) -> Result<bool, string> {
     return Result<bool, string>::Ok(true)
 }
 
+fn drain_response_body(resp_stream#: HttpResponseStream, timeout_ms: i32) -> async Result<usize, string> {
+    auto total_read# = 0:usize
+    auto chunk_buf# = Vec<u8>::with_capacity(4096)
+
+    loop {
+        auto read_res = resp_stream#.read_chunk_into_async(cede chunk_buf, 4096:usize, timeout_ms).await
+        if read_res.is_err() {
+            auto err# = read_res.unwrap_err()
+            return Result<usize, string>::Err(err.message.clone())
+        }
+        auto res# = read_res.unwrap()
+        auto n = res.bytes_read
+        chunk_buf = res#.take_buffer()
+
+        if n == 0:usize {
+            break
+        }
+
+        if total_read + n > MAX_BODY_LIMIT_BYTES {
+            return Result<usize, string>::Err(string::from("Response body exceeded 1 MiB limit"))
+        }
+
+        total_read += n
+
+        if total_read == MAX_BODY_LIMIT_BYTES {
+            // Probe with 1 extra byte to distinguish exact 1 MiB EOF from overflow
+            auto probe_res = resp_stream#.read_chunk_into_async(cede chunk_buf, 1:usize, timeout_ms).await
+            if probe_res.is_err() {
+                auto p_err# = probe_res.unwrap_err()
+                return Result<usize, string>::Err(p_err.message.clone())
+            }
+            auto p_res# = probe_res.unwrap()
+            auto p_n = p_res.bytes_read
+            chunk_buf = p_res#.take_buffer()
+            if p_n > 0:usize {
+                return Result<usize, string>::Err(string::from("Response body exceeded 1 MiB limit"))
+            }
+            break
+        }
+    }
+
+    return Result<usize, string>::Ok(total_read)
+}
+
 pub fn execute_delivery(cfg: Config, event_path: string, dry_run: bool, cli_insecure_override: bool) -> async i32 {
     // 1. Read event payload
     auto payload_res = read_to_string(event_path.clone())
@@ -89,7 +136,7 @@ pub fn execute_delivery(cfg: Config, event_path: string, dry_run: bool, cli_inse
     auto url = url_res.unwrap()
 
     auto allow_insecure = cfg.allow_insecure_http || cli_insecure_override
-    auto sec_res = validate_endpoint_security(url.is_tls(), url.host.clone(), allow_insecure)
+    auto sec_res = validate_endpoint_security(url.scheme.clone(), url.host.clone(), allow_insecure)
     if sec_res.is_err() {
         println("[ERROR] Security policy violation: {}", sec_res.unwrap_err())
         return 1
@@ -127,8 +174,14 @@ pub fn execute_delivery(cfg: Config, event_path: string, dry_run: bool, cli_inse
     auto h_idx# = 0:usize
     loop h_idx < cfg.headers.len() {
         auto *entry = cfg.headers.get_ref(h_idx)
-        if !is_reserved_system_header(entry.key.clone()) {
-            header_map#.insert(entry.key.clone(), entry.value.clone())
+        if is_reserved_system_header(entry.key.clone()) {
+            println("[ERROR] Custom header defines reserved system header '{}'", entry.key)
+            return 1
+        }
+        auto ins_res = header_map#.insert(entry.key.clone(), entry.value.clone())
+        if ins_res.is_err() {
+            println("[ERROR] Failed to insert custom header '{}': {}", entry.key, ins_res.unwrap_err())
+            return 1
         }
         h_idx += 1
     }
@@ -138,7 +191,7 @@ pub fn execute_delivery(cfg: Config, event_path: string, dry_run: bool, cli_inse
     header_map#.insert(string::from("Content-Type"), string::from("application/json"))
     header_map#.insert(string::from("Content-Length"), string::from_int(raw_payload.len() as i32))
     header_map#.insert(string::from("Idempotency-Key"), idempotency_key.clone())
-    header_map#.insert(string::from("User-Agent"), string::from("toka-notifier/0.1.0"))
+    header_map#.insert(string::from("User-Agent"), string::from("toka-notifier/0.1.1"))
     header_map#.insert(string::from("Connection"), string::from("close"))
 
     // 8. Dry-Run Handling
@@ -258,14 +311,16 @@ pub fn execute_delivery(cfg: Config, event_path: string, dry_run: bool, cli_inse
         auto resp_stream# = exec_res.unwrap()
         auto status = resp_stream.status_code
 
-        // Drain response body up to 1MB
-        auto body_bytes_res = resp_stream#.read_all_bytes_async(cfg.timeout_ms).await
-        if body_bytes_res.is_err() {
-            // Non-fatal, just log
-        }
+        // Drain response body up to exact 1MB limit
+        auto drain_res = drain_response_body(resp_stream#, cfg.timeout_ms).await
 
         // Status code discrimination
         if status >= 200 && status < 300 {
+            if drain_res.is_err() {
+                println("[ERROR] Delivery failed: 2xx response body reading failed or exceeded 1 MiB limit ({}). Non-retryable.",
+                        drain_res.unwrap_err())
+                return 1
+            }
             println("[SUCCESS] Delivered event to {} (Status: {}, Idempotency-Key: {}, Attempts: {})",
                     cfg.endpoint, string::from_int(status), idempotency_key, string::from_int(attempt))
             return 0

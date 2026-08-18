@@ -23,7 +23,24 @@ pub fn is_loopback_host(host: string) -> bool {
     return false
 }
 
-pub fn validate_endpoint_security(is_tls: bool, host: string, allow_insecure: bool) -> Result<bool, string> {
+pub fn validate_endpoint_security(scheme: string, host: string, allow_insecure: bool) -> Result<bool, string> {
+    auto lower_scheme = to_lower_ascii(scheme)
+    auto is_tls# = false
+    if lower_scheme.as_str().equals("https") {
+        is_tls = true
+    } else if lower_scheme.as_str().equals("http") {
+        is_tls = false
+    } else {
+        auto err# = string::from("Unsupported URL scheme '")
+        err#.push_str(scheme.as_str())
+        err#.push_str("': notifier only supports 'http' and 'https'")
+        return Result<bool, string>::Err(cede err)
+    }
+
+    if host.len() == 0:usize {
+        return Result<bool, string>::Err(string::from("Invalid endpoint URL: missing host/authority"))
+    }
+
     if is_tls {
         return Result<bool, string>::Ok(false) // Safe TLS
     }
