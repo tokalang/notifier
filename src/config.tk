@@ -1,0 +1,307 @@
+import std/vec::{Vec}
+import core/result::{Result}
+import core/option::{Option}
+import std/fs::{read_to_string}
+
+pub shape HeaderEntry (
+    key: string,
+    value: string
+)
+
+impl HeaderEntry {
+    pub fn clone(self#) -> HeaderEntry {
+        return HeaderEntry(
+            key = self.key.clone(),
+            value = self.value.clone()
+        )
+    }
+}
+
+pub shape Config (
+    endpoint: string,
+    timeout_ms: i32,
+    max_retries: i32,
+    backoff_ms: i32,
+    ca_file: string,
+    allow_insecure_http: bool,
+    headers: Vec<HeaderEntry>
+)
+
+impl Config@Encap {
+    pub endpoint
+    pub timeout_ms
+    pub max_retries
+    pub backoff_ms
+    pub ca_file
+    pub allow_insecure_http
+    pub headers
+    fn drop(self#) {}
+}
+
+impl Config {
+    pub fn default() -> Config {
+        return Config(
+            endpoint = string::from(""),
+            timeout_ms = 5000:i32,
+            max_retries = 3:i32,
+            backoff_ms = 100:i32,
+            ca_file = string::from(""),
+            allow_insecure_http = false,
+            headers = Vec<HeaderEntry>::new()
+        )
+    }
+
+    pub fn clone(self#) -> Config {
+        auto headers_copy# = Vec<HeaderEntry>::with_capacity(self.headers.len())
+        auto i# = 0:usize
+        loop i < self.headers.len() {
+            auto *entry# = self.headers.get_ref(i)
+            headers_copy#.push(entry#.clone())
+            i += 1
+        }
+        return Config(
+            endpoint = self.endpoint.clone(),
+            timeout_ms = self.timeout_ms,
+            max_retries = self.max_retries,
+            backoff_ms = self.backoff_ms,
+            ca_file = self.ca_file.clone(),
+            allow_insecure_http = self.allow_insecure_http,
+            headers = cede headers_copy
+        )
+    }
+}
+
+fn trim_string(s: string) -> string {
+    auto len = s.len()
+    if len == 0:usize { return string::from("") }
+    auto start# = 0:usize
+    loop start < len {
+        auto b = s.as_str().byte_at(start)
+        if b != ' ' && b != '\t' && b != '\r' && b != '\n' {
+            break
+        }
+        start += 1
+    }
+    if start == len { return string::from("") }
+    auto end# = len
+    loop end > start {
+        auto b = s.as_str().byte_at(end - 1:usize)
+        if b != ' ' && b != '\t' && b != '\r' && b != '\n' {
+            break
+        }
+        end -= 1
+    }
+    auto out# = string::from("")
+    auto i# = start
+    loop i < end {
+        out#.push_byte_raw(s.as_str().byte_at(i) as u8)
+        i += 1
+    }
+    return cede out
+}
+
+fn unquote(s: string) -> string {
+    auto t = trim_string(s)
+    auto len = t.len()
+    if len >= 2:usize {
+        auto first = t.as_str().byte_at(0:usize)
+        auto last = t.as_str().byte_at(len - 1:usize)
+        auto is_dquote = first == '"' && last == '"'
+        auto is_squote = first == '\'' && last == '\''
+        if is_dquote || is_squote {
+            auto out# = string::from("")
+            auto i# = 1:usize
+            loop i < len - 1:usize {
+                out#.push_byte_raw(t.as_str().byte_at(i) as u8)
+                i += 1
+            }
+            return cede out
+        }
+    }
+    return t
+}
+
+fn parse_i32(s: string, default_val: i32) -> i32 {
+    auto t = unquote(s)
+    if t.len() == 0:usize { return default_val }
+    auto v# = 0:i32
+    auto i# = 0:usize
+    loop i < t.len() {
+        auto b = t.as_str().byte_at(i)
+        if b < '0' || b > '9' {
+            return default_val
+        }
+        v = v * 10:i32 + ((b as i32) - ('0' as i32))
+        i += 1
+    }
+    return v
+}
+
+fn parse_bool(s: string) -> bool {
+    auto t = unquote(s)
+    if t.as_str().equals("true") || t.as_str().equals("yes") || t.as_str().equals("1") {
+        return true
+    }
+    return false
+}
+
+pub fn parse_config_str(content: string) -> Result<Config, string> {
+    auto cfg# = Config::default()
+    auto in_headers# = false
+
+    auto lines# = Vec<string>::new()
+    auto cur_line# = string::from("")
+    auto i# = 0:usize
+    loop i < content.len() {
+        auto b = content.as_str().byte_at(i)
+        if b == '\n' {
+            lines#.push(cede cur_line#.clone())
+            cur_line = string::from("")
+        } else {
+            cur_line#.push_byte_raw(b as u8)
+        }
+        i += 1
+    }
+    if cur_line.len() > 0:usize {
+        lines#.push(cede cur_line)
+    }
+
+    auto line_idx# = 0:usize
+    loop line_idx < lines.len() {
+        auto *raw_line_ptr = lines.get_ref(line_idx)
+        auto line = raw_line_ptr.clone()
+        line_idx += 1
+
+        // Strip comments
+        auto comment_pos# = -1:i32
+        auto c_idx# = 0:usize
+        loop c_idx < line.len() {
+            if line.as_str().byte_at(c_idx) == '#' {
+                comment_pos = c_idx as i32
+                break
+            }
+            c_idx += 1
+        }
+        auto clean_line# = string::from("")
+        if comment_pos >= 0 {
+            auto k# = 0:usize
+            loop k < comment_pos as usize {
+                clean_line#.push_byte_raw(line.as_str().byte_at(k) as u8)
+                k += 1
+            }
+        } else {
+            clean_line = line.clone()
+        }
+
+        auto trimmed = trim_string(clean_line.clone())
+        if trimmed.len() == 0:usize {
+            continue
+        }
+
+        // Check if line is header child (starts with whitespace in clean_line)
+        auto is_indented# = false
+        if clean_line.len() > 0:usize {
+            auto first_b = clean_line.as_str().byte_at(0:usize)
+            if first_b == ' ' || first_b == '\t' {
+                is_indented = true
+            }
+        }
+
+        if in_headers && is_indented {
+            // Header item "Key: Value"
+            auto colon# = -1:i32
+            auto h_idx# = 0:usize
+            loop h_idx < trimmed.len() {
+                if trimmed.as_str().byte_at(h_idx) == ':' {
+                    colon = h_idx as i32
+                    break
+                }
+                h_idx += 1
+            }
+            if colon > 0 {
+                auto h_key# = string::from("")
+                auto k_idx# = 0:usize
+                loop k_idx < colon as usize {
+                    h_key#.push_byte_raw(trimmed.as_str().byte_at(k_idx) as u8)
+                    k_idx += 1
+                }
+                auto h_val# = string::from("")
+                auto v_idx# = (colon + 1:i32) as usize
+                loop v_idx < trimmed.len() {
+                    h_val#.push_byte_raw(trimmed.as_str().byte_at(v_idx) as u8)
+                    v_idx += 1
+                }
+                cfg.headers#.push(HeaderEntry(
+                    key = trim_string(cede h_key),
+                    value = unquote(trim_string(cede h_val))
+                ))
+            }
+            continue
+        } else {
+            in_headers = false
+        }
+
+        // Top level key: value
+        auto colon# = -1:i32
+        auto idx# = 0:usize
+        loop idx < trimmed.len() {
+            if trimmed.as_str().byte_at(idx) == ':' {
+                colon = idx as i32
+                break
+            }
+            idx += 1
+        }
+        if colon < 0 {
+            continue
+        }
+
+        auto k_str# = string::from("")
+        auto k_i# = 0:usize
+        loop k_i < colon as usize {
+            k_str#.push_byte_raw(trimmed.as_str().byte_at(k_i) as u8)
+            k_i += 1
+        }
+        auto key = trim_string(cede k_str)
+
+        auto v_str# = string::from("")
+        auto v_i# = (colon + 1:i32) as usize
+        loop v_i < trimmed.len() {
+            v_str#.push_byte_raw(trimmed.as_str().byte_at(v_i) as u8)
+            v_i += 1
+        }
+        auto val = trim_string(cede v_str)
+
+        if key.as_str().equals("endpoint") {
+            cfg.endpoint = unquote(val)
+        } else if key.as_str().equals("timeout_ms") {
+            cfg.timeout_ms = parse_i32(val, 5000:i32)
+        } else if key.as_str().equals("max_retries") {
+            cfg.max_retries = parse_i32(val, 3:i32)
+        } else if key.as_str().equals("backoff_ms") {
+            cfg.backoff_ms = parse_i32(val, 100:i32)
+        } else if key.as_str().equals("ca_file") {
+            cfg.ca_file = unquote(val)
+        } else if key.as_str().equals("allow_insecure_http") {
+            cfg.allow_insecure_http = parse_bool(val)
+        } else if key.as_str().equals("headers") {
+            in_headers = true
+        }
+    }
+
+    if cfg.endpoint.len() == 0:usize {
+        return Result<Config, string>::Err(string::from("Missing or empty 'endpoint' in configuration"))
+    }
+
+    return Result<Config, string>::Ok(cede cfg)
+}
+
+pub fn load_config_file(path: string) -> Result<Config, string> {
+    auto content_res = read_to_string(path.clone())
+    if content_res.is_err() {
+        auto err_msg# = string::from("Failed to read config file '")
+        err_msg#.push_str(path.as_str())
+        err_msg#.push_str("'")
+        return Result<Config, string>::Err(cede err_msg)
+    }
+    return parse_config_str(content_res.unwrap())
+}

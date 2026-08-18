@@ -1,0 +1,18 @@
+pub const PACKAGE = (
+    name = "notifier",
+    version = "0.1.0",
+    kind = "application",
+    license = "MIT",
+    compiler = "1.0.0-rc.6",
+    entry_modules = ("src/main.tk",),
+    targets = ("macos", "linux"),
+)
+
+pub const AI_CONTRACT = (
+    schema = "toka-application-v1",
+    summary = "A controlled outbound HTTP/TLS delivery and webhook notification CLI.",
+    capabilities = ("YAML configuration", "raw-byte SHA-256 idempotency key", "strict endpoint security validation", "controlled timeout and retry with backoff", "HTTP status discrimination", "sensitive header redaction in dry-run"),
+    non_goals = ("inbound webhook listener", "database storage", "daemon/cron scheduler", "automatic redirect traversal"),
+    safety = ("plain HTTP is restricted to loopback by default; public plain HTTP requires explicit override; reserved system headers cannot be overridden"),
+    qualification = ("python3 tests/qualify.py")
+)

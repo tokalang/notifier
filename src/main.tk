@@ -1,0 +1,87 @@
+import std/io::{println}
+import std/env::{args}
+import src/config::{load_config_file}
+import src/sender::{execute_delivery}
+
+fn print_usage() {
+    println("notifier - Controlled outbound HTTP/TLS delivery CLI for Toka")
+    println("")
+    println("USAGE:")
+    println("  notifier [OPTIONS] [COMMAND]")
+    println("")
+    println("COMMANDS:")
+    println("  send                       Deliver JSON event to target endpoint (default)")
+    println("")
+    println("OPTIONS:")
+    println("  --config <path>            Path to YAML configuration file (default: ./config.yaml)")
+    println("  --event <path>             Path to JSON event payload file (default: ./event.json)")
+    println("  --dry-run                  Simulate request and print redacted wire frame without network I/O")
+    println("  --allow-insecure-http      Explicitly allow unencrypted public HTTP targets")
+    println("  -v, --version              Print version information")
+    println("  -h, --help                 Print this help message")
+}
+
+fn print_version() {
+    println("notifier 0.1.0 (compiler 1.0.0-rc.6)")
+}
+
+fn main() -> async i32 {
+    auto argv = args()
+    auto config_path# = string::from("config.yaml")
+    auto event_path# = string::from("event.json")
+    auto dry_run# = false
+    auto allow_insecure# = false
+    auto command# = string::from("send")
+
+    auto i# = 1:usize
+    loop i < argv.len() {
+        auto arg = argv.get_ref(i).clone()
+        if arg.as_str().equals("-h") || arg.as_str().equals("--help") {
+            print_usage()
+            return 0
+        } else if arg.as_str().equals("-v") || arg.as_str().equals("--version") {
+            print_version()
+            return 0
+        } else if arg.as_str().equals("--dry-run") {
+            dry_run = true
+        } else if arg.as_str().equals("--allow-insecure-http") {
+            allow_insecure = true
+        } else if arg.as_str().equals("--config") {
+            i += 1
+            if i >= argv.len() {
+                println("[ERROR] Missing argument for --config")
+                return 1
+            }
+            config_path = argv.get_ref(i).clone()
+        } else if arg.as_str().equals("--event") {
+            i += 1
+            if i >= argv.len() {
+                println("[ERROR] Missing argument for --event")
+                return 1
+            }
+            event_path = argv.get_ref(i).clone()
+        } else if arg.as_str().equals("send") {
+            command = string::from("send")
+        } else {
+            println("[ERROR] Unknown option or command: '{}'", arg)
+            print_usage()
+            return 1
+        }
+        i += 1
+    }
+
+    // Load configuration
+    auto cfg_res = load_config_file(config_path.clone())
+    if cfg_res.is_err() {
+        println("[ERROR] Config error: {}", cfg_res.unwrap_err())
+        return 1
+    }
+    auto cfg = cfg_res.unwrap()
+
+    if command.as_str().equals("send") {
+        return execute_delivery(cfg, event_path, dry_run, allow_insecure).await
+    }
+
+    println("[ERROR] Unsupported command: {}", command)
+    return 1
+}

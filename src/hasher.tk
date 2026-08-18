@@ -1,0 +1,7 @@
+import stdx/crypto/sha256::{Sha256}
+
+pub fn compute_sha256_hex(input: str) -> string {
+    auto hasher# = Sha256::new()
+    hasher#.update(input)
+    return hasher#.finalize_hex()
+}

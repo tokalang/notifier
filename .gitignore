@@ -1,0 +1,6 @@
+target/
+.toka/
+*.tar.gz
+*.o
+*.ll
+*.db

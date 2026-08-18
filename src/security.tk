@@ -1,0 +1,73 @@
+import core/result::{Result}
+
+fn to_lower_ascii(s: string) -> string {
+    auto out# = string::from("")
+    auto i# = 0:usize
+    loop i < s.len() {
+        auto b = s.as_str().byte_at(i)
+        if b >= 'A' && b <= 'Z' {
+            out#.push_byte_raw(((b as u8) + 32:u8) as u8)
+        } else {
+            out#.push_byte_raw(b as u8)
+        }
+        i += 1
+    }
+    return cede out
+}
+
+pub fn is_loopback_host(host: string) -> bool {
+    auto lower = to_lower_ascii(host)
+    if lower.as_str().equals("127.0.0.1") || lower.as_str().equals("localhost") {
+        return true
+    }
+    return false
+}
+
+pub fn validate_endpoint_security(is_tls: bool, host: string, allow_insecure: bool) -> Result<bool, string> {
+    if is_tls {
+        return Result<bool, string>::Ok(false) // Safe TLS
+    }
+
+    if is_loopback_host(host.clone()) {
+        return Result<bool, string>::Ok(false) // Safe local loopback HTTP
+    }
+
+    if allow_insecure {
+        return Result<bool, string>::Ok(true) // Explicit override allowed
+    }
+
+    auto err# = string::from("Insecure plain HTTP target '")
+    err#.push_str(host.as_str())
+    err#.push_str("' is forbidden by security policy. Use https:// or enable --allow-insecure-http")
+    return Result<bool, string>::Err(cede err)
+}
+
+pub fn is_reserved_system_header(name: string) -> bool {
+    auto lower = to_lower_ascii(name)
+    if lower.as_str().equals("host") ||
+       lower.as_str().equals("content-length") ||
+       lower.as_str().equals("content-type") ||
+       lower.as_str().equals("idempotency-key") ||
+       lower.as_str().equals("user-agent") ||
+       lower.as_str().equals("connection") ||
+       lower.as_str().equals("transfer-encoding") {
+        return true
+    }
+    return false
+}
+
+pub fn is_sensitive_header(name: string) -> bool {
+    auto lower = to_lower_ascii(name)
+    if lower.as_str().equals("authorization") ||
+       lower.as_str().equals("proxy-authorization") ||
+       lower.as_str().equals("cookie") ||
+       lower.as_str().equals("set-cookie") ||
+       lower.as_str().equals("x-api-key") ||
+       lower.as_str().equals("api-key") ||
+       lower.as_str().equals("token") ||
+       lower.as_str().equals("x-auth-token") ||
+       lower.as_str().equals("secret") {
+        return true
+    }
+    return false
+}
