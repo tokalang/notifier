@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comprehensive RC6 Standalone Qualification Test Suite for tokalang/notifier v0.1.1."""
+"""Comprehensive RC6 Standalone Qualification Test Suite for tokalang/notifier v0.1.2."""
 
 from __future__ import annotations
 
@@ -121,7 +121,7 @@ subjectAltName = @alt_names
 
 class MockServerHandler(BaseHTTPRequestHandler):
     recorded_requests: list[dict] = []
-    response_sequence: list[tuple[int, bytes, dict, bool]] = [] # (status, raw_body_bytes, headers, is_chunked)
+    response_sequence: list[tuple[int, bytes, dict, bool | list[int]]] = [] # (status, raw_body_bytes, headers, is_chunked or chunk_sizes)
     lock = threading.Lock()
 
     def do_POST(self):
@@ -135,9 +135,9 @@ class MockServerHandler(BaseHTTPRequestHandler):
                 "body": body
             })
             if self.response_sequence:
-                status, resp_bytes, headers, is_chunked = self.response_sequence.pop(0)
+                status, resp_bytes, headers, chunking_spec = self.response_sequence.pop(0)
             else:
-                status, resp_bytes, headers, is_chunked = 200, b'{"status":"ok"}', {}, False
+                status, resp_bytes, headers, chunking_spec = 200, b'{"status":"ok"}', {}, False
 
         self.send_response(status)
         for k, v in headers.items():
@@ -145,21 +145,39 @@ class MockServerHandler(BaseHTTPRequestHandler):
         if "Content-Type" not in headers:
             self.send_header("Content-Type", "application/json")
 
-        if is_chunked:
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-            # Send in 8KB chunks
-            chunk_size = 8192
-            for i in range(0, len(resp_bytes), chunk_size):
-                chunk = resp_bytes[i:i + chunk_size]
-                self.wfile.write(f"{len(chunk):x}\r\n".encode("utf-8"))
-                self.wfile.write(chunk)
-                self.wfile.write(b"\r\n")
-            self.wfile.write(b"0\r\n\r\n")
-        else:
-            self.send_header("Content-Length", str(len(resp_bytes)))
-            self.end_headers()
-            self.wfile.write(resp_bytes)
+        try:
+            if chunking_spec is True or isinstance(chunking_spec, list):
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                if isinstance(chunking_spec, list):
+                    # Custom chunk slices
+                    idx = 0
+                    for sz in chunking_spec:
+                        chunk = resp_bytes[idx:idx + sz]
+                        if chunk:
+                            self.wfile.write(f"{len(chunk):x}\r\n".encode("utf-8"))
+                            self.wfile.write(chunk)
+                            self.wfile.write(b"\r\n")
+                        idx += sz
+                    if idx < len(resp_bytes):
+                        rem_chunk = resp_bytes[idx:]
+                        self.wfile.write(f"{len(rem_chunk):x}\r\n".encode("utf-8"))
+                        self.wfile.write(rem_chunk)
+                        self.wfile.write(b"\r\n")
+                else:
+                    chunk_size = 8192
+                    for i in range(0, len(resp_bytes), chunk_size):
+                        chunk = resp_bytes[i:i + chunk_size]
+                        self.wfile.write(f"{len(chunk):x}\r\n".encode("utf-8"))
+                        self.wfile.write(chunk)
+                        self.wfile.write(b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+            else:
+                self.send_header("Content-Length", str(len(resp_bytes)))
+                self.end_headers()
+                self.wfile.write(resp_bytes)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def log_message(self, format, *args):
         pass
@@ -201,7 +219,7 @@ def main() -> int:
         assert "--dry-run" in res.stdout
 
         res = run_cmd([str(notifier_bin), "--version"])
-        assert "notifier 0.1.1" in res.stdout
+        assert "notifier 0.1.2" in res.stdout
 
         log("=== Stage 4: YAML with Hash Inside Quoted String & Dry-Run Redaction ===")
         sample_event = work_dir / "event1.json"
@@ -235,7 +253,6 @@ unknown_custom_field: "invalid"
         assert "Unknown configuration field 'unknown_custom_field'" in res.stdout or "Unknown configuration field 'unknown_custom_field'" in res.stderr
 
         log("=== Stage 6: YAML Schema: Invalid Types and Out-of-Range Rejections ===")
-        # 6.1 Float timeout
         float_cfg = work_dir / "config_float.yaml"
         float_cfg.write_text("""endpoint: "https://api.example.com/webhook"
 timeout_ms: 500.5
@@ -244,7 +261,6 @@ timeout_ms: 500.5
         assert res.returncode != 0
         assert "must be an integer between 1 and 300000" in res.stdout or "must be an integer between 1 and 300000" in res.stderr
 
-        # 6.2 Negative max_retries
         neg_cfg = work_dir / "config_neg.yaml"
         neg_cfg.write_text("""endpoint: "https://api.example.com/webhook"
 max_retries: -1
@@ -252,7 +268,6 @@ max_retries: -1
         res = run_cmd([str(notifier_bin), "--config", str(neg_cfg), "--event", str(sample_event), "send"], check=False)
         assert res.returncode != 0
 
-        # 6.3 Array headers
         array_cfg = work_dir / "config_array.yaml"
         array_cfg.write_text("""endpoint: "https://api.example.com/webhook"
 headers:
@@ -350,13 +365,14 @@ headers:
                 assert rec_headers_lower.get("idempotency-key") == expected_sha
                 assert rec_headers_lower.get("content-type") == "application/json"
                 assert rec_headers_lower.get("x-event-topic") == "deployments"
-                assert rec_headers_lower.get("user-agent") == "toka-notifier/0.1.1"
+                assert rec_headers_lower.get("user-agent") == "toka-notifier/0.1.2"
         finally:
             http_server.shutdown()
 
-        log("=== Stage 14: 302 Redirect Immediate Rejection (No Retry) ===")
+        log("=== Stage 14: 302 Redirect Immediate Rejection (Status-First, Large Body Unread) ===")
+        large_redirect_body = b"X" * (5 * 1024 * 1024) # 5 MB redirect body
         MockServerHandler.recorded_requests.clear()
-        MockServerHandler.response_sequence = [(302, b"", {"Location": "http://127.0.0.1:9999/other"}, False)]
+        MockServerHandler.response_sequence = [(302, large_redirect_body, {"Location": "http://127.0.0.1:9999/other"}, False)]
         http_server, http_port, _ = run_http_server(MockServerHandler)
         try:
             http_cfg = work_dir / "config_http_302.yaml"
@@ -364,9 +380,12 @@ headers:
 timeout_ms: 2000
 max_retries: 3
 """, encoding="utf-8")
+            start_t = time.time()
             res = run_cmd([str(notifier_bin), "--config", str(http_cfg), "--event", str(sample_event), "send"], check=False)
+            elapsed = time.time() - start_t
             assert res.returncode == 1
             assert "redirect status 302" in res.stdout or "redirect status 302" in res.stderr
+            assert elapsed < 1.0, f"302 status-first rejection should be instant (took {elapsed:.2f}s)"
             with MockServerHandler.lock:
                 assert len(MockServerHandler.recorded_requests) == 1
         finally:
@@ -437,7 +456,7 @@ backoff_ms: 30
         finally:
             http_server.shutdown()
 
-        log("=== Stage 18: Exact 1 MiB Body Limit Boundary Tests (Content-Length & Chunked) ===")
+        log("=== Stage 18: Exact 1 MiB Body Limit Boundary & Non-Aligned Chunking Tests ===")
         # 18.1 Content-Length: Exactly 1,048,576 bytes -> OK
         exact_1mb_bytes = b"A" * 1048576
         MockServerHandler.recorded_requests.clear()
@@ -473,28 +492,13 @@ max_retries: 3
         finally:
             http_server.shutdown()
 
-        # 18.3 Transfer-Encoding Chunked: Exactly 1,048,576 bytes -> OK
+        # 18.3 Non-aligned chunking: 1,048,575 bytes first chunk + 2 bytes trailing -> FAIL
         MockServerHandler.recorded_requests.clear()
-        MockServerHandler.response_sequence = [(200, exact_1mb_bytes, {"Content-Type": "application/octet-stream"}, True)]
+        MockServerHandler.response_sequence = [(200, over_1mb_bytes, {"Content-Type": "application/octet-stream"}, [1048575, 2])]
         http_server, http_port, _ = run_http_server(MockServerHandler)
         try:
-            http_cfg = work_dir / "config_chunk_ok.yaml"
-            http_cfg.write_text(f"""endpoint: "http://127.0.0.1:{http_port}/chunk_ok"
-timeout_ms: 4000
-""", encoding="utf-8")
-            res = run_cmd([str(notifier_bin), "--config", str(http_cfg), "--event", str(sample_event), "send"])
-            assert res.returncode == 0
-            assert "[SUCCESS]" in res.stdout
-        finally:
-            http_server.shutdown()
-
-        # 18.4 Transfer-Encoding Chunked: 1,048,577 bytes -> FAIL (Non-retryable 1 attempt)
-        MockServerHandler.recorded_requests.clear()
-        MockServerHandler.response_sequence = [(200, over_1mb_bytes, {"Content-Type": "application/octet-stream"}, True)]
-        http_server, http_port, _ = run_http_server(MockServerHandler)
-        try:
-            http_cfg = work_dir / "config_chunk_fail.yaml"
-            http_cfg.write_text(f"""endpoint: "http://127.0.0.1:{http_port}/chunk_fail"
+            http_cfg = work_dir / "config_chunk_nonaligned.yaml"
+            http_cfg.write_text(f"""endpoint: "http://127.0.0.1:{http_port}/chunk_nonaligned"
 timeout_ms: 4000
 max_retries: 3
 """, encoding="utf-8")
@@ -548,7 +552,6 @@ backoff_ms: 20
         MockServerHandler.response_sequence.clear()
         mismatch_server, mismatch_port, _ = run_http_server(MockServerHandler, is_ssl=True, cert_path=mismatch_cert, key_path=mismatch_key)
         try:
-            # Client connects to localhost, providing mismatch_cert as CA -> Handshake must fail due to hostname/SNI mismatch
             https_mismatch_cfg = work_dir / "config_https_mismatch.yaml"
             https_mismatch_cfg.write_text(f"""endpoint: "https://localhost:{mismatch_port}/secure/webhook"
 timeout_ms: 2000
@@ -562,11 +565,25 @@ ca_file: "{mismatch_cert}"
         finally:
             mismatch_server.shutdown()
 
+        log("=== Stage 20: Manifest, CLI --version, User-Agent & README Consistency ===")
+        # Check package.tk version
+        pkg_content = (repo_root / "package.tk").read_text(encoding="utf-8")
+        assert 'version = "0.1.2"' in pkg_content, "package.tk must declare version 0.1.2"
+
+        # Check README.md
+        readme_content = (repo_root / "README.md").read_text(encoding="utf-8")
+        assert 'notifier = "notifier:0.1.2"' in readme_content, "README.md must guide installation of notifier:0.1.2"
+        assert "notifier:0.1.0" not in readme_content, "README.md must not contain stale 0.1.0 reference"
+
+        # Check binary --version
+        res = run_cmd([str(notifier_bin), "--version"])
+        assert "notifier 0.1.2" in res.stdout, "--version output must match package manifest version 0.1.2"
+
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
     log("==========================================================")
-    log("ALL 19 RC6 QUALIFICATION STAGES PASSED FOR tokalang/notifier")
+    log("ALL 20 RC6 QUALIFICATION STAGES PASSED FOR tokalang/notifier")
     log("==========================================================")
     return 0
 

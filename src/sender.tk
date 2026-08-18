@@ -69,27 +69,8 @@ fn drain_response_body(resp_stream#: HttpResponseStream, timeout_ms: i32) -> asy
     auto chunk_buf# = Vec<u8>::with_capacity(4096)
 
     loop {
-        auto read_res = resp_stream#.read_chunk_into_async(cede chunk_buf, 4096:usize, timeout_ms).await
-        if read_res.is_err() {
-            auto err# = read_res.unwrap_err()
-            return Result<usize, string>::Err(err.message.clone())
-        }
-        auto res# = read_res.unwrap()
-        auto n = res.bytes_read
-        chunk_buf = res#.take_buffer()
-
-        if n == 0:usize {
-            break
-        }
-
-        if total_read + n > MAX_BODY_LIMIT_BYTES {
-            return Result<usize, string>::Err(string::from("Response body exceeded 1 MiB limit"))
-        }
-
-        total_read += n
-
         if total_read == MAX_BODY_LIMIT_BYTES {
-            // Probe with 1 extra byte to distinguish exact 1 MiB EOF from overflow
+            // Exact 1-byte probe to distinguish exact 1 MiB from overflow
             auto probe_res = resp_stream#.read_chunk_into_async(cede chunk_buf, 1:usize, timeout_ms).await
             if probe_res.is_err() {
                 auto p_err# = probe_res.unwrap_err()
@@ -103,6 +84,27 @@ fn drain_response_body(resp_stream#: HttpResponseStream, timeout_ms: i32) -> asy
             }
             break
         }
+
+        auto remaining = MAX_BODY_LIMIT_BYTES - total_read
+        auto to_request# = 4096:usize
+        if to_request > remaining {
+            to_request = remaining
+        }
+
+        auto read_res = resp_stream#.read_chunk_into_async(cede chunk_buf, to_request, timeout_ms).await
+        if read_res.is_err() {
+            auto err# = read_res.unwrap_err()
+            return Result<usize, string>::Err(err.message.clone())
+        }
+        auto res# = read_res.unwrap()
+        auto n = res.bytes_read
+        chunk_buf = res#.take_buffer()
+
+        if n == 0:usize {
+            break
+        }
+
+        total_read += n
     }
 
     return Result<usize, string>::Ok(total_read)
@@ -191,7 +193,7 @@ pub fn execute_delivery(cfg: Config, event_path: string, dry_run: bool, cli_inse
     header_map#.insert(string::from("Content-Type"), string::from("application/json"))
     header_map#.insert(string::from("Content-Length"), string::from_int(raw_payload.len() as i32))
     header_map#.insert(string::from("Idempotency-Key"), idempotency_key.clone())
-    header_map#.insert(string::from("User-Agent"), string::from("toka-notifier/0.1.1"))
+    header_map#.insert(string::from("User-Agent"), string::from("toka-notifier/0.1.2"))
     header_map#.insert(string::from("Connection"), string::from("close"))
 
     // 8. Dry-Run Handling
@@ -311,11 +313,24 @@ pub fn execute_delivery(cfg: Config, event_path: string, dry_run: bool, cli_inse
         auto resp_stream# = exec_res.unwrap()
         auto status = resp_stream.status_code
 
-        // Drain response body up to exact 1MB limit
-        auto drain_res = drain_response_body(resp_stream#, cfg.timeout_ms).await
-
-        // Status code discrimination
-        if status >= 200 && status < 300 {
+        // Status code discrimination (Status-First)
+        if status >= 300 && status < 400 {
+            println("[ERROR] Delivery failed with redirect status {} (automatic redirects forbidden to prevent SSRF). Non-retryable.",
+                    string::from_int(status))
+            return 1
+        } else if status >= 400 && status < 500 {
+            println("[ERROR] Delivery failed with client/policy error status {}. Non-retryable.",
+                    string::from_int(status))
+            return 1
+        } else if status >= 500 {
+            // 5xx Server Error -> Retryable
+            println("[WARN] Attempt {}/{}: Server returned error status {}",
+                    string::from_int(attempt), string::from_int(total_attempts), string::from_int(status))
+            attempt += 1
+            continue
+        } else if status >= 200 && status < 300 {
+            // 2xx -> Only drain body for successful delivery
+            auto drain_res = drain_response_body(resp_stream#, cfg.timeout_ms).await
             if drain_res.is_err() {
                 println("[ERROR] Delivery failed: 2xx response body reading failed or exceeded 1 MiB limit ({}). Non-retryable.",
                         drain_res.unwrap_err())
@@ -324,20 +339,9 @@ pub fn execute_delivery(cfg: Config, event_path: string, dry_run: bool, cli_inse
             println("[SUCCESS] Delivered event to {} (Status: {}, Idempotency-Key: {}, Attempts: {})",
                     cfg.endpoint, string::from_int(status), idempotency_key, string::from_int(attempt))
             return 0
-        } else if status >= 300 && status < 400 {
-            println("[ERROR] Delivery failed with redirect status {} (automatic redirects forbidden to prevent SSRF). Non-retryable.",
-                    string::from_int(status))
-            return 1
-        } else if status >= 400 && status < 500 {
-            println("[ERROR] Delivery failed with client/policy error status {}. Non-retryable.",
-                    string::from_int(status))
-            return 1
         } else {
-            // 5xx Server Error -> Retryable
-            println("[WARN] Attempt {}/{}: Server returned error status {}",
-                    string::from_int(attempt), string::from_int(total_attempts), string::from_int(status))
-            attempt += 1
-            continue
+            println("[ERROR] Unexpected status code {}. Non-retryable.", string::from_int(status))
+            return 1
         }
     }
 

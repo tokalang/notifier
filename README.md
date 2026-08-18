@@ -22,7 +22,7 @@ In your Toka project manifest (`package.tk`):
 
 ```toka
 dependencies = (
-    notifier = "notifier:0.1.0",
+    notifier = "notifier:0.1.2",
 )
 ```
 
