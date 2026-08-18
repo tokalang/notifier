@@ -1,6 +1,6 @@
 pub const PACKAGE = (
     name = "notifier",
-    version = "0.1.2",
+    version = "0.1.3-dev",
     kind = "application",
     license = "MIT",
     compiler = "1.0.0-rc.6",
