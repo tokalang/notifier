@@ -76,6 +76,8 @@ def compile_notifier(repo_root: Path, tokac: Path, sdk_lib: Path) -> Path:
     except Exception:
         link_cmd.extend(["-lssl", "-lcrypto"])
 
+    link_cmd.extend(["-lm", "-lpthread", "-ldl"])
+
     if platform.system() == "Darwin":
         sdk_path = subprocess.run(["xcrun", "--show-sdk-path"], stdout=subprocess.PIPE, text=True).stdout.strip()
         if sdk_path:
